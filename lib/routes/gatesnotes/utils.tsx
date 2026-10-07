@@ -1,5 +1,6 @@
 import { raw } from 'hono/html';
 import { renderToString } from 'hono/jsx/dom/server';
+import { z } from 'zod';
 
 import type { DataItem } from '@/types';
 import cache from '@/utils/cache';
@@ -11,11 +12,27 @@ export const apiUrl = 'https://deliver.kontent.ai/12514eb8-7b51-008e-41a9-512542
 
 const taxonomyUrl = apiUrl.replace(/items$/, 'taxonomies/master_taxonomy');
 
-export const articleElements = ['article_title', 'article_subtitle', 'date', 'byline', 'page_meta_set__keywords', 'page_image_set__thumbnail'].join(',');
+export const articleElements = ['article_title', 'article_subtitle', 'date', 'byline', 'page_taxonomy_set__gn_taxonomy', 'page_image_set__thumbnail'].join(',');
 
-export const bookElements = ['article_title', 'article_subtitle', 'date', 'byline', 'book_title', 'book_author', 'page_meta_set__keywords', 'page_image_set__thumbnail'].join(',');
+export const bookElements = ['article_title', 'article_subtitle', 'date', 'byline', 'book_title', 'book_author', 'page_taxonomy_set__gn_taxonomy', 'page_image_set__thumbnail'].join(',');
 
-type ModularContent = Record<string, any>;
+const assetSchema = z.object({ url: z.string(), type: z.string().optional() });
+const taxonomyTermSchema = z.object({ codename: z.string(), name: z.string() });
+const elementArraySchema = z.array(z.union([z.string(), assetSchema, taxonomyTermSchema]));
+const elementValueSchema = z.union([z.string(), z.number(), z.null(), elementArraySchema]);
+const contentItemSchema = z.object({
+    system: z.object({ type: z.string() }),
+    elements: z.record(z.string(), z.object({ value: elementValueSchema })),
+});
+const articleResponseSchema = z.object({
+    item: contentItemSchema,
+    modular_content: z.record(z.string(), contentItemSchema).optional(),
+});
+
+type ElementValue = z.infer<typeof elementValueSchema>;
+type AssetValue = z.infer<typeof assetSchema>;
+type TaxonomyTerm = z.infer<typeof taxonomyTermSchema>;
+type ModularContent = Record<string, z.infer<typeof contentItemSchema>>;
 
 const flattenTerms = (terms, parent, map) => {
     for (const term of terms) {
@@ -26,11 +43,14 @@ const flattenTerms = (terms, parent, map) => {
 
 const inlineItemRegex = /<object type="application\/kenticocloud"[^>]*data-codename="([^"]+)"[^>]*><\/object>/;
 
-const asString = (value: unknown): string => (typeof value === 'string' ? value : '');
-const asArray = (value: unknown): string[] => (Array.isArray(value) ? (value as string[]) : []);
-const asAsset = (value: unknown): { url?: string; type?: string } | undefined => (Array.isArray(value) ? value[0] : undefined);
+const asString = (value: ElementValue | undefined): string => (typeof value === 'string' ? value : '');
+const asArray = (value: ElementValue | undefined): string[] => (Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []);
+const asAsset = (value: ElementValue | undefined): AssetValue | undefined => {
+    const asset = Array.isArray(value) ? value[0] : undefined;
+    return asset && typeof asset === 'object' && 'url' in asset ? asset : undefined;
+};
 
-function Asset({ value }: { value: unknown }) {
+function Asset({ value }: { value: ElementValue | undefined }) {
     const asset = asAsset(value);
     if (!asset?.url) {
         return null;
@@ -68,7 +88,7 @@ function LinkedItem({ modular, codename }: { modular: ModularContent; codename: 
             );
         case 'image_set': {
             const desktop = asAsset(elements.desktop_image?.value);
-            return <Asset value={desktop?.url ? elements.desktop_image : elements.mobile_image} />;
+            return <Asset value={desktop?.url ? elements.desktop_image?.value : elements.mobile_image?.value} />;
         }
         case 'inline_video_item': {
             const youtubeId = asString(elements.youtube_id?.value);
@@ -133,14 +153,14 @@ function LinkedItem({ modular, codename }: { modular: ModularContent; codename: 
     }
 }
 
-function RichText({ modular, value }: { modular: ModularContent; value: unknown }) {
+function RichText({ modular, value }: { modular: ModularContent; value: ElementValue | undefined }) {
     const parts = asString(value).split(inlineItemRegex);
     return <>{parts.map((part, index) => (index % 2 ? <LinkedItem key={part} modular={modular} codename={part} /> : raw(part)))}</>;
 }
 
 export const getArticleBody = (codename: string): Promise<string> =>
     cache.tryGet(`gatesnotes:body:${codename}`, async () => {
-        const response = await ofetch<{ item: { elements: Record<string, any> }; modular_content?: ModularContent }>(`${apiUrl}/${codename}`);
+        const response = articleResponseSchema.parse(await ofetch(`${apiUrl}/${codename}`));
         return renderToString(<RichText modular={response.modular_content ?? {}} value={response.item.elements.body_content?.value} />);
     });
 
@@ -158,11 +178,8 @@ export const mapArticle = async (item, lead = ''): Promise<DataItem> => {
     const title: string = elements.article_title?.value || '';
     const subtitle: string | undefined = elements.article_subtitle?.value || undefined;
     const image: string | undefined = elements.page_image_set__thumbnail?.value?.[0]?.url;
-    const keywords: string = elements.page_meta_set__keywords?.value || '';
-    const categories: string[] = keywords
-        .split(',')
-        .map((keyword) => keyword.trim())
-        .filter(Boolean);
+    const taxonomy = await getTaxonomy();
+    const categories = (elements.page_taxonomy_set__gn_taxonomy?.value ?? []).map((term: TaxonomyTerm) => taxonomy[term.codename]?.name).filter(Boolean);
     const date: string | undefined = elements.date?.value || undefined;
     const byline: string | undefined = elements.byline?.value || undefined;
 
